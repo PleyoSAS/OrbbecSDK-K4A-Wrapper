@@ -1,0 +1,1 @@
+pleyo_fps.exe lists all the devices connected to the system and displays each camera fps. 
