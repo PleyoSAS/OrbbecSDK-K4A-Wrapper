@@ -40,8 +40,6 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    vector<k4a_device_t> devices(device_count);
-
     // Configuration setup (WFOV Binned = 512x512)
     k4a_device_configuration_t config;
     config.color_format = (k4a_image_format_t)0;         // K4A_IMAGE_FORMAT_COLOR_MJPEG
@@ -54,25 +52,8 @@ int main(int argc, char **argv)
     config.subordinate_delay_off_master_usec = 0;
     config.disable_streaming_indicator = false;
 
-    // 1. Open cameras and Wait
-    for (uint32_t i = 0; i < device_count; i++)
-    {
-        if (K4A_RESULT_SUCCEEDED == k4a_device_open(i, &devices[i]))
-        {
-            cout << "[INFO] Camera " << i << " connected. Waiting for stabilization..." << endl;
-
-            // Safety delay between connect and start
-            this_thread::sleep_for(chrono::milliseconds(1000));
-
-            if (K4A_RESULT_SUCCEEDED != k4a_device_start_cameras(devices[i], &config))
-            {
-                k4a_device_close(devices[i]);
-                devices[i] = NULL;
-                continue;
-            }
-            k4a_device_start_imu(devices[i]);
-        }
-    }
+    const chrono::milliseconds connect_delay(200);
+    const chrono::milliseconds close_delay(100);
 
     ofstream log_file;
     if (should_log_to_file)
@@ -89,19 +70,32 @@ int main(int argc, char **argv)
         }
     };
 
-    // 2. Process each camera (in parallel)
+    // 1. Process each camera (in parallel)
     vector<thread> workers;
     workers.reserve(device_count);
 
     for (uint32_t i = 0; i < device_count; i++)
     {
-        if (devices[i] == NULL)
-        {
-            continue;
-        }
-
         workers.emplace_back([&, i]() {
-            string serial = get_serial(devices[i]);
+            k4a_device_t device = NULL;
+            if (K4A_RESULT_SUCCEEDED != k4a_device_open(i, &device))
+            {
+                log_line("[WARN] Failed to open camera index " + to_string(i));
+                return;
+            }
+
+            log_line("[INFO] Camera " + to_string(i) + " connected. Waiting for stabilization...");
+            this_thread::sleep_for(connect_delay);
+
+            if (K4A_RESULT_SUCCEEDED != k4a_device_start_cameras(device, &config))
+            {
+                log_line("[WARN] Failed to start cameras for index " + to_string(i));
+                k4a_device_close(device);
+                return;
+            }
+            k4a_device_start_imu(device);
+
+            string serial = get_serial(device);
             k4a_capture_t capture = NULL;
             uint64_t last_ts_color = 0, last_ts_depth = 0, last_ts_ir = 0;
 
@@ -110,7 +104,7 @@ int main(int argc, char **argv)
             log_line("[INFO] Flushing buffer for camera " + serial + "...");
             for (int flush = 0; flush < 20; flush++)
             {
-                if (k4a_device_get_capture(devices[i], &capture, 0) == K4A_WAIT_RESULT_SUCCEEDED)
+                if (k4a_device_get_capture(device, &capture, 0) == K4A_WAIT_RESULT_SUCCEEDED)
                 {
                     k4a_capture_release(capture);
                 }
@@ -122,7 +116,7 @@ int main(int argc, char **argv)
                 int count_color = 0, count_depth = 0, count_ir = 0;
 
                 // Wait for one fresh frame before starting the timer
-                if (k4a_device_get_capture(devices[i], &capture, 2000) == K4A_WAIT_RESULT_SUCCEEDED)
+                if (k4a_device_get_capture(device, &capture, 2000) == K4A_WAIT_RESULT_SUCCEEDED)
                 {
                     k4a_capture_release(capture);
                 }
@@ -131,7 +125,7 @@ int main(int argc, char **argv)
 
                 while (count_color < 10 || count_depth < 10 || count_ir < 10)
                 {
-                    if (k4a_device_get_capture(devices[i], &capture, 1000) == K4A_WAIT_RESULT_SUCCEEDED)
+                    if (k4a_device_get_capture(device, &capture, 1000) == K4A_WAIT_RESULT_SUCCEEDED)
                     {
 
                         // Independent Check for Color
@@ -195,8 +189,14 @@ int main(int argc, char **argv)
 
                 // IMU data heartbeat
                 k4a_imu_sample_t imu_sample;
-                k4a_device_get_imu_sample(devices[i], &imu_sample, 0);
+                k4a_device_get_imu_sample(device, &imu_sample, 0);
             }
+
+            k4a_device_stop_imu(device);
+            k4a_device_stop_cameras(device);
+            log_line("[INFO] Streams stopped for camera " + serial + ". Waiting before close...");
+            this_thread::sleep_for(close_delay);
+            k4a_device_close(device);
         });
     }
 
@@ -211,19 +211,5 @@ int main(int argc, char **argv)
     if (should_log_to_file)
         log_file.close();
 
-    // 3. Stop and Close with safety delay
-    for (uint32_t i = 0; i < device_count; i++)
-    {
-        if (devices[i])
-        {
-            k4a_device_stop_imu(devices[i]);
-            k4a_device_stop_cameras(devices[i]);
-
-            cout << "[INFO] Streams stopped for camera " << i << ". Waiting before close..." << endl;
-            this_thread::sleep_for(chrono::milliseconds(500));
-
-            k4a_device_close(devices[i]);
-        }
-    }
     return 0;
 }
