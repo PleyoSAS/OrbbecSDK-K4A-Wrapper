@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 #include <string>
+#include <mutex>
 
 // Include the standard header
 #include <k4a/k4a.h>
@@ -30,6 +31,7 @@ int main(int argc, char **argv)
 {
     string log_file_path = (argc >= 2) ? argv[1] : "";
     bool should_log_to_file = !log_file_path.empty();
+    mutex log_mutex;
 
     uint32_t device_count = k4a_device_get_installed_count();
     if (device_count == 0)
@@ -78,108 +80,131 @@ int main(int argc, char **argv)
         log_file.open(log_file_path, ios::out | ios::trunc);
     }
 
-    // 2. Process each camera
+    auto log_line = [&](const string &line) {
+        lock_guard<mutex> lock(log_mutex);
+        cout << line << endl;
+        if (should_log_to_file && log_file.is_open())
+        {
+            log_file << line << endl;
+        }
+    };
+
+    // 2. Process each camera (in parallel)
+    vector<thread> workers;
+    workers.reserve(device_count);
+
     for (uint32_t i = 0; i < device_count; i++)
     {
         if (devices[i] == NULL)
-            continue;
-        string serial = get_serial(devices[i]);
-        k4a_capture_t capture = NULL;
-        uint64_t last_ts_color = 0, last_ts_depth = 0, last_ts_ir = 0;
-
-        // --- FLUSH BUFFER ---
-        // We empty the accumulated frames in the USB buffer to ensure real-time measurement
-        cout << "[INFO] Flushing buffer for camera " << serial << "..." << endl;
-        for (int flush = 0; flush < 20; flush++)
         {
-            if (k4a_device_get_capture(devices[i], &capture, 0) == K4A_WAIT_RESULT_SUCCEEDED)
-            {
-                k4a_capture_release(capture);
-            }
+            continue;
         }
 
-        // 6 batches of 10 unique frames
-        for (int batch = 1; batch <= 6; batch++)
-        {
-            int count_color = 0, count_depth = 0, count_ir = 0;
+        workers.emplace_back([&, i]() {
+            string serial = get_serial(devices[i]);
+            k4a_capture_t capture = NULL;
+            uint64_t last_ts_color = 0, last_ts_depth = 0, last_ts_ir = 0;
 
-            // Wait for one fresh frame before starting the timer
-            if (k4a_device_get_capture(devices[i], &capture, 2000) == K4A_WAIT_RESULT_SUCCEEDED)
+            // --- FLUSH BUFFER ---
+            // We empty the accumulated frames in the USB buffer to ensure real-time measurement
+            log_line("[INFO] Flushing buffer for camera " + serial + "...");
+            for (int flush = 0; flush < 20; flush++)
             {
-                k4a_capture_release(capture);
-            }
-
-            auto start_time = chrono::high_resolution_clock::now();
-
-            while (count_color < 10 || count_depth < 10 || count_ir < 10)
-            {
-                if (k4a_device_get_capture(devices[i], &capture, 1000) == K4A_WAIT_RESULT_SUCCEEDED)
+                if (k4a_device_get_capture(devices[i], &capture, 0) == K4A_WAIT_RESULT_SUCCEEDED)
                 {
-
-                    // Independent Check for Color
-                    k4a_image_t img_color = k4a_capture_get_color_image(capture);
-                    if (img_color != NULL)
-                    {
-                        uint64_t ts = k4a_image_get_device_timestamp_usec(img_color);
-                        if (ts != last_ts_color)
-                        {
-                            count_color++;
-                            last_ts_color = ts;
-                        }
-                        k4a_image_release(img_color);
-                    }
-
-                    // Independent Check for Depth
-                    k4a_image_t img_depth = k4a_capture_get_depth_image(capture);
-                    if (img_depth != NULL)
-                    {
-                        uint64_t ts = k4a_image_get_device_timestamp_usec(img_depth);
-                        if (ts != last_ts_depth)
-                        {
-                            count_depth++;
-                            last_ts_depth = ts;
-                        }
-                        k4a_image_release(img_depth);
-                    }
-
-                    // Independent Check for Infrared
-                    k4a_image_t img_ir = k4a_capture_get_ir_image(capture);
-                    if (img_ir != NULL)
-                    {
-                        uint64_t ts = k4a_image_get_device_timestamp_usec(img_ir);
-                        if (ts != last_ts_ir)
-                        {
-                            count_ir++;
-                            last_ts_ir = ts;
-                        }
-                        k4a_image_release(img_ir);
-                    }
                     k4a_capture_release(capture);
                 }
-                else
-                {
-                    break;
-                }
             }
 
-            auto end_time = chrono::high_resolution_clock::now();
-            double duration = chrono::duration<double>(end_time - start_time).count();
+            // 10 batches of 10 unique frames
+            for (int batch = 1; batch <= 10; batch++)
+            {
+                int count_color = 0, count_depth = 0, count_ir = 0;
 
-            double fps_color = (duration > 0) ? (double)count_color / duration : 0;
-            double fps_depth = (duration > 0) ? (double)count_depth / duration : 0;
-            double fps_ir = (duration > 0) ? (double)count_ir / duration : 0;
+                // Wait for one fresh frame before starting the timer
+                if (k4a_device_get_capture(devices[i], &capture, 2000) == K4A_WAIT_RESULT_SUCCEEDED)
+                {
+                    k4a_capture_release(capture);
+                }
 
-            string log_entry = "Camera: " + serial + " | Batch: " + to_string(batch) +
-                               " | Color: " + to_string(fps_color) + " FPS" + " | Depth: " + to_string(fps_depth) +
-                               " FPS" + " | IR: " + to_string(fps_ir) + " FPS";
+                auto start_time = chrono::high_resolution_clock::now();
 
-            cout << "[LOG] " << log_entry << endl;
-            if (should_log_to_file && log_file.is_open())
-                log_file << log_entry << endl;
+                while (count_color < 10 || count_depth < 10 || count_ir < 10)
+                {
+                    if (k4a_device_get_capture(devices[i], &capture, 1000) == K4A_WAIT_RESULT_SUCCEEDED)
+                    {
 
-            // IMU data heartbeat
-            k4a_imu_sample_t imu_sample;
-            k4a_device_get_imu_sample(devices[i], &imu_sample, 0);
+                        // Independent Check for Color
+                        k4a_image_t img_color = k4a_capture_get_color_image(capture);
+                        if (img_color != NULL)
+                        {
+                            uint64_t ts = k4a_image_get_device_timestamp_usec(img_color);
+                            if (ts != last_ts_color)
+                            {
+                                count_color++;
+                                last_ts_color = ts;
+                            }
+                            k4a_image_release(img_color);
+                        }
+
+                        // Independent Check for Depth
+                        k4a_image_t img_depth = k4a_capture_get_depth_image(capture);
+                        if (img_depth != NULL)
+                        {
+                            uint64_t ts = k4a_image_get_device_timestamp_usec(img_depth);
+                            if (ts != last_ts_depth)
+                            {
+                                count_depth++;
+                                last_ts_depth = ts;
+                            }
+                            k4a_image_release(img_depth);
+                        }
+
+                        // Independent Check for Infrared
+                        k4a_image_t img_ir = k4a_capture_get_ir_image(capture);
+                        if (img_ir != NULL)
+                        {
+                            uint64_t ts = k4a_image_get_device_timestamp_usec(img_ir);
+                            if (ts != last_ts_ir)
+                            {
+                                count_ir++;
+                                last_ts_ir = ts;
+                            }
+                            k4a_image_release(img_ir);
+                        }
+                        k4a_capture_release(capture);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                auto end_time = chrono::high_resolution_clock::now();
+                double duration = chrono::duration<double>(end_time - start_time).count();
+
+                double fps_color = (duration > 0) ? (double)count_color / duration : 0;
+                double fps_depth = (duration > 0) ? (double)count_depth / duration : 0;
+                double fps_ir = (duration > 0) ? (double)count_ir / duration : 0;
+
+                string log_entry = "Camera: " + serial + " | Batch: " + to_string(batch) +
+                                   " | Color: " + to_string(fps_color) + " FPS | Depth: " + to_string(fps_depth) +
+                                   " FPS | IR: " + to_string(fps_ir) + " FPS";
+
+                log_line("[LOG] " + log_entry);
+
+                // IMU data heartbeat
+                k4a_imu_sample_t imu_sample;
+                k4a_device_get_imu_sample(devices[i], &imu_sample, 0);
+            }
+        });
+    }
+
+    for (auto &worker : workers)
+    {
+        if (worker.joinable())
+        {
+            worker.join();
         }
     }
 
